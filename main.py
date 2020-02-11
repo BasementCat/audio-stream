@@ -14,34 +14,30 @@ import pyaudio
 
 
 DISCOVERY_PACKET_MAGIC = b'AstR'
-DISCOVERY_PACKET_VERSION = 1
+DISCOVERY_PACKET_VERSION = 2
 DISCOVERY_PACKET_FMT_H = '!4sH'
-DISCOVERY_PACKET_FMT_D = '4sHIBB'
-DISCOVERY_PACKET_FIELDS = ('addr', 'port', 'rate', 'bits', 'channels')
+DISCOVERY_PACKET_FMT_D = '4sHHIBB'
+DISCOVERY_PACKET_FIELDS = ('addr', 'port', 'framerate', 'rate', 'bits', 'channels')
 
 DEFAULT_DISCOVERY_PORT = 32123
 DEFAULT_MULTICAST_ADDR = '239.32.12.3'
 DEFAULT_MULTICAST_PORT = 32124
+
+DEFAULT_FRAMERATE = 100
 
 
 root_logger = logger = logging.getLogger()
 logging.basicConfig(level=logging.ERROR)
 
 
-def interruptible_sleep(stop_event, duration, sleep_duration=0.25):
-    t = time.time()
-    while not stop_event.is_set() and time.time() - t < duration:
-        time.sleep(sleep_duration)
-
-
 class DiscoverySenderThread(threading.Thread):
-    def __init__(self, stop_event, rate, bits, channels, discovery_port=None, multicast_addr=None, multicast_port=None, *args, **kwargs):
+    def __init__(self, stop_event, framerate, rate, bits, channels, discovery_port=None, multicast_addr=None, multicast_port=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.stop_event = stop_event
         self.discovery_port = discovery_port or DEFAULT_DISCOVERY_PORT
         self.packet = struct.pack(DISCOVERY_PACKET_FMT_H, DISCOVERY_PACKET_MAGIC, DISCOVERY_PACKET_VERSION) \
             + struct.pack(DISCOVERY_PACKET_FMT_D, ipaddress.ip_address(multicast_addr or DEFAULT_MULTICAST_ADDR).packed,
-                multicast_port or DEFAULT_MULTICAST_PORT, rate, bits, channels)
+                multicast_port or DEFAULT_MULTICAST_PORT, framerate, rate, bits, channels)
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -50,7 +46,9 @@ class DiscoverySenderThread(threading.Thread):
     def run(self):
         while not self.stop_event.is_set():
             self.sock.sendto(self.packet, ('<broadcast>', self.discovery_port))
-            interruptible_sleep(self.stop_event, 3)
+            t = time.time()
+            while not self.stop_event.is_set() and time.time() - t < 3:
+                time.sleep(0.25)
         self.sock.close()
 
 
@@ -76,7 +74,7 @@ def receive_discovery_packet(port=None, timeout=10):
                     from_addr=addr,
                 )
                 out['addr'] = str(ipaddress.ip_address(out['addr']))
-                logger.info("Got discovery packet from %s - receive data on %s:%d at %d KHz/%d bits/%d channels", out['from_addr'][0], out['addr'], out['port'], out['rate'], out['bits'], out['channels'])
+                logger.info("Got discovery packet from %s - receive data on %s:%d at %d KHz/%d bits/%d channels, %d FPS", out['from_addr'][0], out['addr'], out['port'], out['rate'], out['bits'], out['channels'], out['framerate'])
                 return out
             except socket.timeout:
                 pass
@@ -85,17 +83,18 @@ def receive_discovery_packet(port=None, timeout=10):
 
 
 class AudioCaptureThread(threading.Thread):
-    def __init__(self, stop_event, output_queue, device_index_name, rate, bits, channels, *args, **kwargs):
+    def __init__(self, stop_event, output_queue, device_index_name, framerate, rate, bits, channels, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.stop_event = stop_event
         self.output_queue = output_queue
+        self.framerate = framerate
         self.audio = pyaudio.PyAudio()
         self.stream = self.audio.open(
             format=getattr(pyaudio, 'paInt' + str(bits)),
             channels=channels,
             rate=rate,
             input=True,
-            frames_per_buffer=int(rate / 100),
+            frames_per_buffer=int(rate / framerate),
             input_device_index=self.get_device_index(device_index_name),
             stream_callback=self.handle_data
         )
@@ -131,7 +130,7 @@ class AudioCaptureThread(threading.Thread):
         try:
             self.stream.start_stream()
             while not self.stop_event.is_set() and self.stream.is_active():
-                time.sleep(1 / 100)
+                time.sleep(1 / self.framerate)
         finally:
             self.stream.stop_stream()
             self.stream.close()
@@ -207,10 +206,11 @@ class MulticastSendThread(threading.Thread):
 
 
 class MulticastReceiveThread(threading.Thread):
-    def __init__(self, stop_event, output_queue, multicast_addr, multicast_port, *args, **kwargs):
+    def __init__(self, stop_event, output_queue, multicast_addr, multicast_port, framerate, rate, bits, channels, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.stop_event = stop_event
         self.output_queue = output_queue
+        self.packet_size = int((((bits / 8) * channels) * rate) / framerate) + 2
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(1)
         self.sock.bind(('', multicast_port))
@@ -221,7 +221,7 @@ class MulticastReceiveThread(threading.Thread):
     def run(self):
         while not self.stop_event.is_set():
             try:
-                data, addr = self.sock.recvfrom(8192)
+                data, addr = self.sock.recvfrom(self.packet_size * 2)
                 self.output_queue.put(data)
             except socket.timeout:
                 pass
@@ -276,6 +276,7 @@ def parse_args():
     capture_parser.add_argument('--rate', '-r', default=48000, help="Sample rate in KHz")
     capture_parser.add_argument('--bits', '-b', default=32, help="Sample bit rate")
     capture_parser.add_argument('--channels', '-c', default=2, help="Number of channels to capture")
+    capture_parser.add_argument('--framerate', '-f', default=DEFAULT_FRAMERATE, help="Frame rate (packets per second)")
     capture_parser.add_argument('--discovery-port', '-d', default=DEFAULT_DISCOVERY_PORT, help="Broadcast discovery packets on this port")
     capture_parser.add_argument('--multicast-addr', '-a', default=DEFAULT_MULTICAST_ADDR, help="Send audio data to this multicast address")
     capture_parser.add_argument('--multicast-port', '-p', default=DEFAULT_MULTICAST_PORT, help="Send audio data on this multicast port")
@@ -298,11 +299,11 @@ def main(args):
     comp_queue = queue.Queue()
 
     if args.cmd == 'capture':
-        logger.info("Preparing threads for capture from device '%s' at %d KHz/%d bit/%d channels", args.device, args.rate, args.bits, args.channels)
+        logger.info("Preparing threads for capture from device '%s' at %d KHz/%d bit/%d channels, %d FPS", args.device, args.rate, args.bits, args.channels, args.framerate)
         logger.info("Will send multicast data to %s:%s, broadcast discovery packets on port %d", args.multicast_addr, args.multicast_port, args.discovery_port)
         threads = [
-            DiscoverySenderThread(stop_event, args.rate, args.bits, args.channels, discovery_port=args.discovery_port, multicast_addr=args.multicast_addr, multicast_port=args.multicast_port),
-            AudioCaptureThread(stop_event, raw_queue, args.device, args.rate, args.bits, args.channels),
+            DiscoverySenderThread(stop_event, args.framerate, args.rate, args.bits, args.channels, discovery_port=args.discovery_port, multicast_addr=args.multicast_addr, multicast_port=args.multicast_port),
+            AudioCaptureThread(stop_event, raw_queue, args.device, args.framerate, args.rate, args.bits, args.channels),
             CompressionThread(stop_event, raw_queue, comp_queue),
             MulticastSendThread(stop_event, comp_queue, multicast_addr=args.multicast_addr, multicast_port=args.multicast_port),
         ]
@@ -313,7 +314,7 @@ def main(args):
             logger.error("Did not receive discovery packet")
             return -1
         threads = [
-            MulticastReceiveThread(stop_event, comp_queue, data['addr'], data['port']),
+            MulticastReceiveThread(stop_event, comp_queue, data['addr'], data['port'], data['framerate'], data['rate'], data['bits'], data['channels']),
             DecompressionThread(stop_event, comp_queue, raw_queue),
             AudioPlaybackThread(stop_event, raw_queue, data['rate'], data['bits'], data['channels']),
         ]
