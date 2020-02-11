@@ -165,7 +165,7 @@ class DecompressionThread(threading.Thread):
         self.stop_event = stop_event
         self.input_queue = input_queue
         self.output_queue = output_queue
-        self.buffer = b''
+        self.buffer = bytearray()
 
     def run(self):
         while not self.stop_event.is_set():
@@ -176,11 +176,11 @@ class DecompressionThread(threading.Thread):
                 data = self.buffer[2:data_len + 2]
                 data = zlib.decompress(data)
                 self.output_queue.put(data)
-                self.buffer = self.buffer[data_len + 2:]
+                del self.buffer[:data_len + 2]
 
             try:
                 while True:
-                    self.buffer += self.input_queue.get(block=False)
+                    self.buffer.extend(self.input_queue.get(block=False))
             except queue.Empty:
                 pass
 
@@ -233,7 +233,7 @@ class AudioPlaybackThread(threading.Thread):
         self.stop_event = stop_event
         self.input_queue = input_queue
         self.frame_size = int((bits / 8) * channels)
-        self.buffer = b''
+        self.buffer = bytearray()
         self.audio = pyaudio.PyAudio()
         self.stream = self.audio.open(
             format=getattr(pyaudio, 'paInt' + str(bits)),
@@ -257,12 +257,12 @@ class AudioPlaybackThread(threading.Thread):
         need_bytes = frame_count * self.frame_size
         while len(self.buffer) < need_bytes and not self.stop_event.is_set():
             try:
-                self.buffer += self.input_queue.get(block=False)
+                self.buffer.extend(self.input_queue.get(block=False))
             except queue.Empty:
                 pass
 
-        out = self.buffer[:need_bytes]
-        self.buffer = self.buffer[need_bytes:]
+        out = bytes(self.buffer[:need_bytes])
+        del self.buffer[:need_bytes]
         return (out, pyaudio.paContinue)
 
 
