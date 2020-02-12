@@ -263,6 +263,7 @@ class MulticastReceiveThread(threading.Thread):
         self.multicast_port = multicast_port
         self.packet_size = int((((bits / 8) * channels) * rate) / framerate) + 2
         self.sock = None
+        self.last_data = time.time()
         self.connect()
 
     def connect(self):
@@ -280,8 +281,11 @@ class MulticastReceiveThread(threading.Thread):
             try:
                 data, addr = self.sock.recvfrom(self.packet_size * 2)
                 self.output_queue.put(data)
+                self.last_data = time.time()
             except socket.timeout:
-                pass
+                if time.time() - self.last_data > 2:
+                    logger.error("No data for 2s, restarting")
+                    self.stop_event.set()
             except socket.error:
                 logger.error("Failed to receive multicast data", exc_info=True)
                 self.connect()
@@ -429,6 +433,7 @@ def main(args):
             break
 
         # Did not stop in response to a signal - restart
+        stop_event.clear()
         logger.info("Restarting...")
 
 
