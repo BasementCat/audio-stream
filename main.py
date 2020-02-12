@@ -303,6 +303,7 @@ class AudioPlaybackThread(threading.Thread):
             output=True,
             stream_callback=self.handle_data
         )
+        self.underflows = []
 
     def run(self):
         try:
@@ -317,6 +318,16 @@ class AudioPlaybackThread(threading.Thread):
     def handle_data(self, in_data, frame_count, time_info, status):
         if status:
             logger.error("Got flag in playback thread: %s - timing %s", PA_FLAGS.get(status, status), time_info)
+
+            if status == pyaudio.paOutputUnderflow:
+                now = time.time()
+                self.underflows.append(now)
+                if len(self.underflows) > 2:
+                    self.underflows = [v for v in self.underflows if v > now - 10]
+                    if len(self.underflows) > 2:
+                        if len(self.underflows) / (max(self.underflows) - min(self.underflows)) > 1:
+                            logger.error("More than 1 underflow/sec in playback thread, restarting")
+                            self.stop_event.set()
 
         need_bytes = frame_count * self.frame_size
         while len(self.buffer) < need_bytes and not self.stop_event.is_set():
@@ -337,13 +348,13 @@ def parse_args():
 
     capture_parser = subparsers.add_parser('capture', help="Capture and transmit audio", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     capture_parser.add_argument('device', help="Capture audio from this device.  Can be a device index, name, or regular expression")
-    capture_parser.add_argument('--rate', '-r', default=48000, help="Sample rate in KHz")
-    capture_parser.add_argument('--bits', '-b', default=32, help="Sample bit rate")
-    capture_parser.add_argument('--channels', '-c', default=2, help="Number of channels to capture")
-    capture_parser.add_argument('--framerate', '-f', default=DEFAULT_FRAMERATE, help="Frame rate (packets per second)")
-    capture_parser.add_argument('--discovery-port', '-d', default=DEFAULT_DISCOVERY_PORT, help="Broadcast discovery packets on this port")
+    capture_parser.add_argument('--rate', '-r', default=48000, type=int, help="Sample rate in KHz")
+    capture_parser.add_argument('--bits', '-b', default=32, type=int, help="Sample bit rate")
+    capture_parser.add_argument('--channels', '-c', default=2, type=int, help="Number of channels to capture")
+    capture_parser.add_argument('--framerate', '-f', default=DEFAULT_FRAMERATE, type=int, help="Frame rate (packets per second)")
+    capture_parser.add_argument('--discovery-port', '-d', default=DEFAULT_DISCOVERY_PORT, type=int, help="Broadcast discovery packets on this port")
     capture_parser.add_argument('--multicast-addr', '-a', default=DEFAULT_MULTICAST_ADDR, help="Send audio data to this multicast address")
-    capture_parser.add_argument('--multicast-port', '-p', default=DEFAULT_MULTICAST_PORT, help="Send audio data on this multicast port")
+    capture_parser.add_argument('--multicast-port', '-p', default=DEFAULT_MULTICAST_PORT, type=int, help="Send audio data on this multicast port")
     capture_parser.set_defaults(cmd='capture')
 
     receive_parser = subparsers.add_parser('receive', help="Receive audio data over the network and play it back", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -358,54 +369,67 @@ def main(args):
         root_logger.setLevel(logging.DEBUG)
 
     stop_event = threading.Event()
+    signal_event = threading.Event()
 
     def sighandler(signo, frame):
         stop_event.set()
+        signal_event.set()
     signal.signal(signal.SIGINT, sighandler)
     signal.signal(signal.SIGTERM, sighandler)
 
-    threads = []
-    raw_queue = queue.Queue()
-    comp_queue = queue.Queue()
+    while True:
+        threads = []
+        raw_queue = queue.Queue()
+        comp_queue = queue.Queue()
 
-    if args.cmd == 'capture':
-        logger.info("Preparing threads for capture from device '%s' at %d KHz/%d bit/%d channels, %d FPS", args.device, args.rate, args.bits, args.channels, args.framerate)
-        logger.info("Will send multicast data to %s:%s, broadcast discovery packets on port %d", args.multicast_addr, args.multicast_port, args.discovery_port)
-        threads = [
-            DiscoverySenderThread(stop_event, args.framerate, args.rate, args.bits, args.channels, discovery_port=args.discovery_port, multicast_addr=args.multicast_addr, multicast_port=args.multicast_port),
-            AudioCaptureThread(stop_event, raw_queue, args.device, args.framerate, args.rate, args.bits, args.channels),
-            CompressionThread(stop_event, raw_queue, comp_queue),
-            MulticastSendThread(stop_event, comp_queue, multicast_addr=args.multicast_addr, multicast_port=args.multicast_port),
-        ]
-    elif args.cmd == 'receive':
-        logger.debug("Waiting for discovery packet on port %d...", args.discovery_port)
-        data = receive_discovery_packet(stop_event, port=args.discovery_port)
-        if not data:
-            logger.error("Did not receive discovery packet")
-            return -1
-        threads = [
-            MulticastReceiveThread(stop_event, comp_queue, data['addr'], data['port'], data['framerate'], data['rate'], data['bits'], data['channels']),
-            DecompressionThread(stop_event, comp_queue, raw_queue),
-            AudioPlaybackThread(stop_event, raw_queue, data['rate'], data['bits'], data['channels']),
-        ]
+        if args.cmd == 'capture':
+            logger.info("Preparing threads for capture from device '%s' at %d KHz/%d bit/%d channels, %d FPS", args.device, args.rate, args.bits, args.channels, args.framerate)
+            logger.info("Will send multicast data to %s:%s, broadcast discovery packets on port %d", args.multicast_addr, args.multicast_port, args.discovery_port)
+            threads = [
+                DiscoverySenderThread(stop_event, args.framerate, args.rate, args.bits, args.channels, discovery_port=args.discovery_port, multicast_addr=args.multicast_addr, multicast_port=args.multicast_port),
+                AudioCaptureThread(stop_event, raw_queue, args.device, args.framerate, args.rate, args.bits, args.channels),
+                CompressionThread(stop_event, raw_queue, comp_queue),
+                MulticastSendThread(stop_event, comp_queue, multicast_addr=args.multicast_addr, multicast_port=args.multicast_port),
+            ]
+        elif args.cmd == 'receive':
+            while True:
+                logger.debug("Waiting for discovery packet on port %d...", args.discovery_port)
+                data = receive_discovery_packet(stop_event, port=args.discovery_port)
+                if not data:
+                    logger.error("Did not receive discovery packet")
+                    continue
+                break
 
-    if not threads:
-        logger.critical("No threads to run")
-        return -98
+            threads = [
+                MulticastReceiveThread(stop_event, comp_queue, data['addr'], data['port'], data['framerate'], data['rate'], data['bits'], data['channels']),
+                DecompressionThread(stop_event, comp_queue, raw_queue),
+                AudioPlaybackThread(stop_event, raw_queue, data['rate'], data['bits'], data['channels']),
+            ]
 
-    try:
-        logger.info("Start %d threads", len(threads))
-        for t in threads:
-            t.start()
+        if not threads:
+            logger.critical("No threads to run")
+            return -98
 
-        while not stop_event.is_set():
-            time.sleep(0.5)
+        try:
+            logger.info("Start %d threads", len(threads))
+            for t in threads:
+                t.start()
 
-    finally:
-        logger.info("Stopping threads")
-        stop_event.set()
-        for t in threads:
-            t.join()
+            while not stop_event.is_set():
+                time.sleep(0.5)
+
+        finally:
+            logger.info("Stopping threads")
+            stop_event.set()
+            for t in threads:
+                t.join()
+
+        if signal_event.is_set():
+            # Stopped in response to a signal, restart
+            break
+
+        # Did not stop in response to a signal - restart
+        logger.info("Restarting...")
 
 
 if __name__ == '__main__':
