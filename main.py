@@ -13,6 +13,14 @@ import re
 import pyaudio
 
 
+PA_FLAGS = {
+    pyaudio.paInputUnderflow: 'paInputUnderflow',
+    pyaudio.paInputOverflow: 'paInputOverflow',
+    pyaudio.paOutputUnderflow: 'paOutputUnderflow',
+    pyaudio.paOutputOverflow: 'paOutputOverflow',
+    pyaudio.paPrimingOutput: 'paPrimingOutput',
+}
+
 DISCOVERY_PACKET_MAGIC = b'AstR'
 DISCOVERY_PACKET_VERSION = 2
 DISCOVERY_PACKET_FMT_H = '!4sH'
@@ -39,13 +47,23 @@ class DiscoverySenderThread(threading.Thread):
             + struct.pack(DISCOVERY_PACKET_FMT_D, ipaddress.ip_address(multicast_addr or DEFAULT_MULTICAST_ADDR).packed,
                 multicast_port or DEFAULT_MULTICAST_PORT, framerate, rate, bits, channels)
 
+        self.sock = None
+        self.connect()
+
+    def connect(self):
+        if self.sock:
+            self.sock.close()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
     def run(self):
         while not self.stop_event.is_set():
-            self.sock.sendto(self.packet, ('<broadcast>', self.discovery_port))
+            try:
+                self.sock.sendto(self.packet, ('<broadcast>', self.discovery_port))
+            except socket.error:
+                logger.error("Failed to send discovery packet", exc_info=True)
+                self.connect()
             t = time.time()
             while not self.stop_event.is_set() and time.time() - t < 3:
                 time.sleep(0.25)
@@ -53,16 +71,30 @@ class DiscoverySenderThread(threading.Thread):
 
 
 def receive_discovery_packet(port=None, timeout=10):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) # UDP
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.settimeout(timeout)
-    sock.bind(("", DEFAULT_DISCOVERY_PORT))
+    sock = None
+    def connect():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) # UDP
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(timeout)
+        sock.bind(("", DEFAULT_DISCOVERY_PORT))
+        return sock
+
+    sock = connect()
     try:
         t_start = time.time()
         while time.time() - t_start < timeout:
             try:
-                data, addr = sock.recvfrom(1024)
+                try:
+                    data, addr = sock.recvfrom(1024)
+                except socket.timeout:
+                    raise
+                except socket.error:
+                    if sock:
+                        sock.close()
+                    sock = connect()
+                    continue
+
                 if data[:4] != DISCOVERY_PACKET_MAGIC:
                     continue
                 magic, version = struct.unpack(DISCOVERY_PACKET_FMT_H, data[:struct.calcsize(DISCOVERY_PACKET_FMT_H)])
@@ -137,6 +169,8 @@ class AudioCaptureThread(threading.Thread):
             self.audio.terminate()
 
     def handle_data(self, in_data, frame_count, time_info, status_flags):
+        if status_flags:
+            logger.error("Got flag in capture thread: %s - timing %s", PA_FLAGS.get(status_flags, status_flags), time_info)
         self.output_queue.put(in_data)
         return (None, pyaudio.paContinue)
 
@@ -157,6 +191,8 @@ class CompressionThread(threading.Thread):
                 self.output_queue.put(data)
             except queue.Empty:
                 pass
+            except:
+                logger.error("Failed to compress data", exc_info=True)
 
 
 class DecompressionThread(threading.Thread):
@@ -169,13 +205,16 @@ class DecompressionThread(threading.Thread):
 
     def run(self):
         while not self.stop_event.is_set():
-            while self.buffer and not self.stop_event.is_set():
+            while len(self.buffer) >= 2 and not self.stop_event.is_set():
                 data_len, = struct.unpack('!H', self.buffer[:2])
                 if len(self.buffer) - 2 <= data_len:
                     break
                 data = self.buffer[2:data_len + 2]
-                data = zlib.decompress(data)
-                self.output_queue.put(data)
+                try:
+                    data = zlib.decompress(data)
+                    self.output_queue.put(data)
+                except:
+                    logger.error("Failed to decompress data", exc_info=True)
                 del self.buffer[:data_len + 2]
 
             try:
@@ -191,6 +230,12 @@ class MulticastSendThread(threading.Thread):
         self.stop_event = stop_event
         self.input_queue = input_queue
         self.multicast_group = (multicast_addr or DEFAULT_MULTICAST_ADDR, multicast_port or DEFAULT_MULTICAST_PORT)
+        self.sock = None
+        self.connect()
+
+    def connect(self):
+        if self.sock:
+            self.sock.close()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(0)
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, struct.pack('b', 1))
@@ -202,6 +247,9 @@ class MulticastSendThread(threading.Thread):
                 self.sock.sendto(data, self.multicast_group)
             except queue.Empty:
                 pass
+            except socket.error:
+                logger.error("Failed to send multicast data", exc_info=True)
+                self.connect()
         self.sock.close()
 
 
@@ -210,11 +258,19 @@ class MulticastReceiveThread(threading.Thread):
         super().__init__(*args, **kwargs)
         self.stop_event = stop_event
         self.output_queue = output_queue
+        self.multicast_addr = multicast_addr
+        self.multicast_port = multicast_port
         self.packet_size = int((((bits / 8) * channels) * rate) / framerate) + 2
+        self.sock = None
+        self.connect()
+
+    def connect(self):
+        if self.sock:
+            self.sock.close()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(1)
-        self.sock.bind(('', multicast_port))
-        group = socket.inet_aton(multicast_addr)
+        self.sock.bind(('', self.multicast_port))
+        group = socket.inet_aton(self.multicast_addr)
         mreq = struct.pack('4sL', group, socket.INADDR_ANY)
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
@@ -225,6 +281,10 @@ class MulticastReceiveThread(threading.Thread):
                 self.output_queue.put(data)
             except socket.timeout:
                 pass
+            except socket.error:
+                logger.error("Failed to receive multicast data", exc_info=True)
+                self.connect()
+        self.sock.close()
 
 
 class AudioPlaybackThread(threading.Thread):
@@ -254,6 +314,9 @@ class AudioPlaybackThread(threading.Thread):
             self.audio.terminate()
 
     def handle_data(self, in_data, frame_count, time_info, status):
+        if status:
+            logger.error("Got flag in playback thread: %s - timing %s", PA_FLAGS.get(status, status), time_info)
+
         need_bytes = frame_count * self.frame_size
         while len(self.buffer) < need_bytes and not self.stop_event.is_set():
             try:
