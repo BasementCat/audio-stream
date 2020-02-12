@@ -4,6 +4,7 @@ import argparse
 import logging
 import socket
 import struct
+import signal
 import time
 import queue
 import zlib
@@ -70,20 +71,20 @@ class DiscoverySenderThread(threading.Thread):
         self.sock.close()
 
 
-def receive_discovery_packet(port=None, timeout=10):
+def receive_discovery_packet(stop_event, port=None, timeout=10):
     sock = None
     def connect():
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) # UDP
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(timeout)
+        sock.settimeout(0.5)
         sock.bind(("", DEFAULT_DISCOVERY_PORT))
         return sock
 
     sock = connect()
     try:
         t_start = time.time()
-        while time.time() - t_start < timeout:
+        while not stop_event.is_set() and time.time() - t_start < timeout:
             try:
                 try:
                     data, addr = sock.recvfrom(1024)
@@ -356,8 +357,14 @@ def main(args):
     if args.debug:
         root_logger.setLevel(logging.DEBUG)
 
-    threads = []
     stop_event = threading.Event()
+
+    def sighandler(signo, frame):
+        stop_event.set()
+    signal.signal(signal.SIGINT, sighandler)
+    signal.signal(signal.SIGTERM, sighandler)
+
+    threads = []
     raw_queue = queue.Queue()
     comp_queue = queue.Queue()
 
@@ -372,7 +379,7 @@ def main(args):
         ]
     elif args.cmd == 'receive':
         logger.debug("Waiting for discovery packet on port %d...", args.discovery_port)
-        data = receive_discovery_packet(port=args.discovery_port)
+        data = receive_discovery_packet(stop_event, port=args.discovery_port)
         if not data:
             logger.error("Did not receive discovery packet")
             return -1
@@ -391,11 +398,9 @@ def main(args):
         for t in threads:
             t.start()
 
-        while True:
-            time.sleep(0.1)
+        while not stop_event.is_set():
+            time.sleep(0.5)
 
-    except KeyboardInterrupt:
-        logger.info("Exiting - SIGINT")
     finally:
         logger.info("Stopping threads")
         stop_event.set()
